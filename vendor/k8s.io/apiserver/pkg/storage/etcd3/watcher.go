@@ -69,30 +69,29 @@ func TestOnlySetFatalOnDecodeError(b bool) {
 }
 
 type watcher struct {
-	client                   *clientv3.Client
-	codec                    runtime.Codec
-	newFunc                  func() runtime.Object
-	objectType               string
-	groupResource            schema.GroupResource
-	versioner                storage.Versioner
-	transformer              value.Transformer
-	getCurrentStorageRV      func(context.Context) (uint64, error)
-	getResourceSizeEstimator func() *resourceSizeEstimator
+	client              *clientv3.Client
+	codec               runtime.Codec
+	newFunc             func() runtime.Object
+	objectType          string
+	groupResource       schema.GroupResource
+	versioner           storage.Versioner
+	transformer         value.Transformer
+	getCurrentStorageRV func(context.Context) (uint64, error)
 }
 
 // watchChan implements watch.Interface.
 type watchChan struct {
-	watcher                  *watcher
-	key                      string
-	initialRev               int64
-	recursive                bool
-	progressNotify           bool
-	internalPred             storage.SelectionPredicate
-	ctx                      context.Context
-	cancel                   context.CancelFunc
-	incomingEventChan        chan *event
-	resultChan               chan watch.Event
-	getResourceSizeEstimator func() *resourceSizeEstimator
+	watcher           *watcher
+	key               string
+	initialRev        int64
+	recursive         bool
+	progressNotify    bool
+	internalPred      storage.SelectionPredicate
+	ctx               context.Context
+	cancel            context.CancelFunc
+	incomingEventChan chan *event
+	resultChan        chan watch.Event
+	errChan           chan error
 }
 
 // Watch watches on a key and returns a watch.Interface that transfers relevant notifications.
@@ -104,7 +103,7 @@ type watchChan struct {
 // pred must be non-nil. Only if opts.Predicate matches the change, it will be returned.
 func (w *watcher) Watch(ctx context.Context, key string, rev int64, opts storage.ListOptions) (watch.Interface, error) {
 	if opts.Recursive && !strings.HasSuffix(key, "/") {
-		return nil, fmt.Errorf(`recursive key needs to end with "/"`)
+		key += "/"
 	}
 	if opts.ProgressNotify && w.newFunc == nil {
 		return nil, apierrors.NewInternalError(errors.New("progressNotify for watch is unsupported by the etcd storage because no newFunc was provided"))
@@ -128,15 +127,15 @@ func (w *watcher) Watch(ctx context.Context, key string, rev int64, opts storage
 
 func (w *watcher) createWatchChan(ctx context.Context, key string, rev int64, recursive, progressNotify bool, pred storage.SelectionPredicate) *watchChan {
 	wc := &watchChan{
-		watcher:                  w,
-		key:                      key,
-		initialRev:               rev,
-		recursive:                recursive,
-		progressNotify:           progressNotify,
-		internalPred:             pred,
-		incomingEventChan:        make(chan *event, incomingBufSize),
-		resultChan:               make(chan watch.Event, outgoingBufSize),
-		getResourceSizeEstimator: w.getResourceSizeEstimator,
+		watcher:           w,
+		key:               key,
+		initialRev:        rev,
+		recursive:         recursive,
+		progressNotify:    progressNotify,
+		internalPred:      pred,
+		incomingEventChan: make(chan *event, incomingBufSize),
+		resultChan:        make(chan watch.Event, outgoingBufSize),
+		errChan:           make(chan error, 1),
 	}
 	if pred.Empty() {
 		// The filter doesn't filter out any object.
@@ -229,16 +228,24 @@ func isCancelError(err error) bool {
 
 func (wc *watchChan) run(initialEventsEndBookmarkRequired, forceInitialEvents bool) {
 	watchClosedCh := make(chan struct{})
-	var resultChanWG sync.WaitGroup
+	go wc.startWatching(watchClosedCh, initialEventsEndBookmarkRequired, forceInitialEvents)
 
-	resultChanWG.Add(1)
-	go func() {
-		defer resultChanWG.Done()
-		wc.startWatching(watchClosedCh, initialEventsEndBookmarkRequired, forceInitialEvents)
-	}()
+	var resultChanWG sync.WaitGroup
 	wc.processEvents(&resultChanWG)
 
 	select {
+	case err := <-wc.errChan:
+		if isCancelError(err) {
+			break
+		}
+		errResult := transformErrorToEvent(err)
+		if errResult != nil {
+			// error result is guaranteed to be received by user before closing ResultChan.
+			select {
+			case wc.resultChan <- *errResult:
+			case <-wc.ctx.Done(): // user has given up all results
+			}
+		}
 	case <-watchClosedCh:
 	case <-wc.ctx.Done(): // user cancel
 	}
@@ -290,7 +297,7 @@ func (wc *watchChan) sync() error {
 	for {
 		startTime := time.Now()
 		getResp, err = wc.watcher.client.KV.Get(wc.ctx, preparedKey, opts...)
-		metrics.RecordEtcdRequest(metricsOp, wc.watcher.groupResource, err, startTime)
+		metrics.RecordEtcdRequest(metricsOp, wc.watcher.groupResource.String(), err, startTime)
 		if err != nil {
 			return interpretListError(err, true, preparedKey, wc.key)
 		}
@@ -302,7 +309,7 @@ func (wc *watchChan) sync() error {
 		// send items from the response until no more results
 		for i, kv := range getResp.Kvs {
 			lastKey = kv.Key
-			wc.queueEvent(parseKV(kv))
+			wc.sendEvent(parseKV(kv))
 			// free kv early. Long lists can take O(seconds) to decode.
 			getResp.Kvs[i] = nil
 		}
@@ -371,7 +378,7 @@ func (wc *watchChan) startWatching(watchClosedCh chan struct{}, initialEventsEnd
 		}
 	}
 	if initialEventsEndBookmarkRequired {
-		wc.queueEvent(func() *event {
+		wc.sendEvent(func() *event {
 			e := progressNotifyEvent(wc.initialRev)
 			e.isInitialEventsEndBookmark = true
 			return e
@@ -385,48 +392,29 @@ func (wc *watchChan) startWatching(watchClosedCh chan struct{}, initialEventsEnd
 		opts = append(opts, clientv3.WithProgressNotify())
 	}
 	wch := wc.watcher.client.Watch(wc.ctx, wc.key, opts...)
-	estimator := wc.getResourceSizeEstimator()
 	for wres := range wch {
 		if wres.Err() != nil {
 			err := wres.Err()
 			// If there is an error on server (e.g. compaction), the channel will return it before closed.
 			logWatchChannelErr(err)
-			// sendError doesn't guarantee that no more items will be put into resultChan.
-			// However, by returning from startWatching here, we guarantee, that events
-			// with higher resourceVersion than the error will not be queue and thus also
-			// processed and send to the user.
-			// TODO(wojtek-t): Figure out if we can synchronously prevent more events.
 			wc.sendError(err)
 			return
 		}
 		if wres.IsProgressNotify() {
-			wc.queueEvent(progressNotifyEvent(wres.Header.GetRevision()))
-			metrics.RecordEtcdBookmark(wc.watcher.groupResource)
+			wc.sendEvent(progressNotifyEvent(wres.Header.GetRevision()))
+			metrics.RecordEtcdBookmark(wc.watcher.groupResource.String())
 			continue
 		}
 
 		for _, e := range wres.Events {
-			if estimator != nil {
-				switch e.Type {
-				case clientv3.EventTypePut:
-					estimator.UpdateKey(e.Kv)
-				case clientv3.EventTypeDelete:
-					estimator.DeleteKey(e.Kv)
-				}
-			}
-			metrics.RecordEtcdEvent(wc.watcher.groupResource)
+			metrics.RecordEtcdEvent(wc.watcher.groupResource.String())
 			parsedEvent, err := parseEvent(e)
 			if err != nil {
 				logWatchChannelErr(err)
-				// sendError doesn't guarantee that no more items will be put into resultChan.
-				// However, by returning from startWatching here, we guarantee, that events
-				// with higher resourceVersion than the error will not be queue and thus also
-				// processed and send to the user.
-				// TODO(wojtek-t): Figure out if we can synchronously prevent more events.
 				wc.sendError(err)
 				return
 			}
-			wc.queueEvent(parsedEvent)
+			wc.sendEvent(parsedEvent)
 		}
 	}
 	// When we come to this point, it's only possible that client side ends the watch.
@@ -450,16 +438,19 @@ func (wc *watchChan) serialProcessEvents(wg *sync.WaitGroup) {
 	for {
 		select {
 		case e := <-wc.incomingEventChan:
-			res, err := wc.transform(e)
-			if err != nil {
-				wc.sendError(err)
-				return
-			}
-
+			res := wc.transform(e)
 			if res == nil {
 				continue
 			}
-			if !wc.sendEvent(res) {
+			if len(wc.resultChan) == cap(wc.resultChan) {
+				klog.V(3).InfoS("Fast watcher, slow processing. Probably caused by slow dispatching events to watchers", "outgoingEvents", outgoingBufSize, "objectType", wc.watcher.objectType, "groupResource", wc.watcher.groupResource)
+			}
+			// If user couldn't receive results fast enough, we also block incoming events from watcher.
+			// Because storing events in local will cause more memory usage.
+			// The worst case would be closing the fast watcher.
+			select {
+			case wc.resultChan <- *res:
+			case <-wc.ctx.Done():
 				return
 			}
 		case <-wc.ctx.Done():
@@ -470,8 +461,10 @@ func (wc *watchChan) serialProcessEvents(wg *sync.WaitGroup) {
 
 func (wc *watchChan) concurrentProcessEvents(wg *sync.WaitGroup) {
 	p := concurrentOrderedEventProcessing{
-		wc:              wc,
-		processingQueue: make(chan chan *processingResult, processEventConcurrency-1),
+		input:           wc.incomingEventChan,
+		processFunc:     wc.transform,
+		output:          wc.resultChan,
+		processingQueue: make(chan chan *watch.Event, processEventConcurrency-1),
 
 		objectType:    wc.watcher.objectType,
 		groupResource: wc.watcher.groupResource,
@@ -488,15 +481,12 @@ func (wc *watchChan) concurrentProcessEvents(wg *sync.WaitGroup) {
 	}()
 }
 
-type processingResult struct {
-	event *watch.Event
-	err   error
-}
-
 type concurrentOrderedEventProcessing struct {
-	wc *watchChan
+	input       chan *event
+	processFunc func(*event) *watch.Event
+	output      chan watch.Event
 
-	processingQueue chan chan *processingResult
+	processingQueue chan chan *watch.Event
 	// Metadata for logging
 	objectType    string
 	groupResource schema.GroupResource
@@ -508,29 +498,28 @@ func (p *concurrentOrderedEventProcessing) scheduleEventProcessing(ctx context.C
 		select {
 		case <-ctx.Done():
 			return
-		case e = <-p.wc.incomingEventChan:
+		case e = <-p.input:
 		}
-		processingResponse := make(chan *processingResult, 1)
+		processingResponse := make(chan *watch.Event, 1)
 		select {
 		case <-ctx.Done():
 			return
 		case p.processingQueue <- processingResponse:
 		}
 		wg.Add(1)
-		go func(e *event, response chan<- *processingResult) {
+		go func(e *event, response chan<- *watch.Event) {
 			defer wg.Done()
-			responseEvent, err := p.wc.transform(e)
 			select {
 			case <-ctx.Done():
-			case response <- &processingResult{event: responseEvent, err: err}:
+			case response <- p.processFunc(e):
 			}
 		}(e, processingResponse)
 	}
 }
 
 func (p *concurrentOrderedEventProcessing) collectEventProcessing(ctx context.Context) {
-	var processingResponse chan *processingResult
-	var r *processingResult
+	var processingResponse chan *watch.Event
+	var e *watch.Event
 	for {
 		select {
 		case <-ctx.Done():
@@ -540,17 +529,21 @@ func (p *concurrentOrderedEventProcessing) collectEventProcessing(ctx context.Co
 		select {
 		case <-ctx.Done():
 			return
-		case r = <-processingResponse:
+		case e = <-processingResponse:
 		}
-		if r.err != nil {
-			p.wc.sendError(r.err)
-			return
-		}
-		if r.event == nil {
+		if e == nil {
 			continue
 		}
-		if !p.wc.sendEvent(r.event) {
+		if len(p.output) == cap(p.output) {
+			klog.V(3).InfoS("Fast watcher, slow processing. Probably caused by slow dispatching events to watchers", "outgoingEvents", outgoingBufSize, "objectType", p.objectType, "groupResource", p.groupResource)
+		}
+		// If user couldn't receive results fast enough, we also block incoming events from watcher.
+		// Because storing events in local will cause more memory usage.
+		// The worst case would be closing the fast watcher.
+		select {
+		case <-ctx.Done():
 			return
+		case p.output <- *e:
 		}
 	}
 }
@@ -568,11 +561,12 @@ func (wc *watchChan) acceptAll() bool {
 }
 
 // transform transforms an event into a result for user if not filtered.
-func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
+func (wc *watchChan) transform(e *event) (res *watch.Event) {
 	curObj, oldObj, err := wc.prepareObjs(e)
 	if err != nil {
 		klog.Errorf("failed to prepare current and previous objects: %v", err)
-		return nil, err
+		wc.sendError(err)
+		return nil
 	}
 
 	switch {
@@ -580,11 +574,12 @@ func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
 		object := wc.watcher.newFunc()
 		if err := wc.watcher.versioner.UpdateObject(object, uint64(e.rev)); err != nil {
 			klog.Errorf("failed to propagate object version: %v", err)
-			return nil, fmt.Errorf("failed to propagate object resource version: %w", err)
+			return nil
 		}
 		if e.isInitialEventsEndBookmark {
 			if err := storage.AnnotateInitialEventsEndBookmark(object); err != nil {
-				return nil, fmt.Errorf("error while accessing object's metadata gr: %v, type: %v, obj: %#v, err: %w", wc.watcher.groupResource, wc.watcher.objectType, object, err)
+				wc.sendError(fmt.Errorf("error while accessing object's metadata gr: %v, type: %v, obj: %#v, err: %v", wc.watcher.groupResource, wc.watcher.objectType, object, err))
+				return nil
 			}
 		}
 		res = &watch.Event{
@@ -593,7 +588,7 @@ func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
 		}
 	case e.isDeleted:
 		if !wc.filter(oldObj) {
-			return nil, nil
+			return nil
 		}
 		res = &watch.Event{
 			Type:   watch.Deleted,
@@ -601,7 +596,7 @@ func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
 		}
 	case e.isCreated:
 		if !wc.filter(curObj) {
-			return nil, nil
+			return nil
 		}
 		res = &watch.Event{
 			Type:   watch.Added,
@@ -613,7 +608,7 @@ func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
 				Type:   watch.Modified,
 				Object: curObj,
 			}
-			return res, nil
+			return res
 		}
 		curObjPasses := wc.filter(curObj)
 		oldObjPasses := wc.filter(oldObj)
@@ -635,7 +630,7 @@ func (wc *watchChan) transform(e *event) (res *watch.Event, err error) {
 			}
 		}
 	}
-	return res, nil
+	return res
 }
 
 func transformErrorToEvent(err error) *watch.Event {
@@ -650,44 +645,14 @@ func transformErrorToEvent(err error) *watch.Event {
 	}
 }
 
-// sendError synchronously puts an error event into resultChan and
-// trigger cancelling all goroutines.
 func (wc *watchChan) sendError(err error) {
-	// We use wc.ctx to reap all goroutines. Under whatever condition, we should stop them all.
-	// It's fine to double cancel.
-	defer wc.cancel()
-
-	if isCancelError(err) {
-		return
-	}
-	errResult := transformErrorToEvent(err)
-	if errResult != nil {
-		// error result is guaranteed to be received by user before closing ResultChan.
-		select {
-		case wc.resultChan <- *errResult:
-		case <-wc.ctx.Done(): // user has given up all results
-		}
-	}
-}
-
-// sendEvent synchronously puts an event into resultChan.
-// Returns true if it was successful.
-func (wc *watchChan) sendEvent(event *watch.Event) bool {
-	if len(wc.resultChan) == cap(wc.resultChan) {
-		klog.V(3).InfoS("Fast watcher, slow processing. Probably caused by slow dispatching events to watchers", "outgoingEvents", outgoingBufSize, "objectType", wc.watcher.objectType, "groupResource", wc.watcher.groupResource)
-	}
-	// If user couldn't receive results fast enough, we also block incoming events from watcher.
-	// Because storing events in local will cause more memory usage.
-	// The worst case would be closing the fast watcher.
 	select {
-	case wc.resultChan <- *event:
-		return true
+	case wc.errChan <- err:
 	case <-wc.ctx.Done():
-		return false
 	}
 }
 
-func (wc *watchChan) queueEvent(e *event) {
+func (wc *watchChan) sendEvent(e *event) {
 	if len(wc.incomingEventChan) == incomingBufSize {
 		klog.V(3).InfoS("Fast watcher, slow processing. Probably caused by slow decoding, user not receiving fast, or other processing logic", "incomingEvents", incomingBufSize, "objectType", wc.watcher.objectType, "groupResource", wc.watcher.groupResource)
 	}

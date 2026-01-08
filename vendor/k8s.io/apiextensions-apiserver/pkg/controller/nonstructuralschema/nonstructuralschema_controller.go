@@ -48,7 +48,7 @@ type ConditionController struct {
 	crdSynced cache.InformerSynced
 
 	// To allow injection for testing.
-	syncFn func(ctx context.Context, key string) error
+	syncFn func(key string) error
 
 	queue workqueue.TypedRateLimitingInterface[string]
 
@@ -132,7 +132,7 @@ func calculateCondition(in *apiextensionsv1.CustomResourceDefinition) *apiextens
 	return cond
 }
 
-func (c *ConditionController) sync(ctx context.Context, key string) error {
+func (c *ConditionController) sync(key string) error {
 	inCustomResourceDefinition, err := c.crdLister.Get(key)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -169,7 +169,7 @@ func (c *ConditionController) sync(ctx context.Context, key string) error {
 		apiextensionshelpers.SetCRDCondition(crd, *cond)
 	}
 
-	_, err = c.crdClient.CustomResourceDefinitions().UpdateStatus(ctx, crd, metav1.UpdateOptions{})
+	_, err = c.crdClient.CustomResourceDefinitions().UpdateStatus(context.TODO(), crd, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		// deleted or changed in the meantime, we'll get called again
 		return nil
@@ -188,45 +188,38 @@ func (c *ConditionController) sync(ctx context.Context, key string) error {
 }
 
 // Run starts the controller.
-//
-//logcheck:context // RunWithContext should be used instead of Run in code which supports contextual logging.
 func (c *ConditionController) Run(workers int, stopCh <-chan struct{}) {
-	c.RunWithContext(workers, wait.ContextForChannel(stopCh))
-}
-
-// RunWithContext is a context-aware version of Run.
-func (c *ConditionController) RunWithContext(workers int, ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
 	klog.Infof("Starting NonStructuralSchemaConditionController")
 	defer klog.Infof("Shutting down NonStructuralSchemaConditionController")
 
-	if !cache.WaitForCacheSync(ctx.Done(), c.crdSynced) {
+	if !cache.WaitForCacheSync(stopCh, c.crdSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
+		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
 
-	<-ctx.Done()
+	<-stopCh
 }
 
-func (c *ConditionController) runWorker(ctx context.Context) {
-	for c.processNextWorkItem(ctx) {
+func (c *ConditionController) runWorker() {
+	for c.processNextWorkItem() {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
-func (c *ConditionController) processNextWorkItem(ctx context.Context) bool {
+func (c *ConditionController) processNextWorkItem() bool {
 	key, quit := c.queue.Get()
 	if quit {
 		return false
 	}
 	defer c.queue.Done(key)
 
-	err := c.syncFn(ctx, key)
+	err := c.syncFn(key)
 	if err == nil {
 		c.queue.Forget(key)
 		return true

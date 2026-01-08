@@ -93,7 +93,9 @@ func (k *localCRDsClient) Paths() (map[string]openapi.GroupVersion, error) {
 		Kind:    "CustomResourceDefinition",
 	}
 	for _, document := range documents {
-		crdObj, parsedGVK, err := codecs.Decode(document, &crdGVK, nil)
+		crdObj, parsedGVK, err := codecs.Decode(
+			document,
+			&crdGVK, nil)
 
 		// If the error is that the GVK is not registered, or
 		// this objects's GK is not what we were looking for,
@@ -127,12 +129,11 @@ func (k *localCRDsClient) Paths() (map[string]openapi.GroupVersion, error) {
 				Version: v.Name,
 				Kind:    crd.Spec.Names.Kind,
 			}
-			gvkObj := map[string]any{
-				"group":   gvk.Group,
-				"version": gvk.Version,
-				"kind":    gvk.Kind,
+			gvkObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&gvk)
+			if err != nil {
+				return nil, err
 			}
-			sch.AddExtension("x-kubernetes-group-version-kind", []any{gvkObj})
+			sch.AddExtension("x-kubernetes-group-version-kind", []interface{}{gvkObj})
 			// Add schema extension to propagate the scope
 			sch.AddExtension("x-kubectl-validate-scope", string(crd.Spec.Scope))
 			key := fmt.Sprintf("%s/%s.%s", gvk.Group, gvk.Version, gvk.Kind)

@@ -23,21 +23,11 @@ import (
 	"k8s.io/component-base/featuregate"
 )
 
-// Every feature gate should have an entry here following this template:
-//
-// // owner: @username
-// MyFeature() bool
-//
-// Feature gates should be listed in alphabetical, case-sensitive
-// (upper before any lower case character) order. This reduces the risk
-// of code conflicts because changes are more likely to be scattered
-// across the file.
 const (
-	// owner: @michaelasp
-	// kep: https://kep.k8s.io/4192
+	// Every feature gate should add method here following this template:
 	//
-	// Enables the tracking of observed generation in CRD status and conditions.
-	CRDObservedGenerationTracking featuregate.Feature = "CRDObservedGenerationTracking"
+	// // owner: @username
+	// MyFeature() bool
 
 	// owner: @alexzielenski
 	//
@@ -63,13 +53,9 @@ func init() {
 //
 // Entries are alphabetized.
 var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
-	CRDObservedGenerationTracking: {
-		{Version: version.MustParse("1.35"), PreRelease: featuregate.Beta, Default: false},
-	},
 	CRDValidationRatcheting: {
 		{Version: version.MustParse("1.28"), Default: false, PreRelease: featuregate.Alpha},
 		{Version: version.MustParse("1.30"), Default: true, PreRelease: featuregate.Beta},
-		{Version: version.MustParse("1.33"), Default: true, LockToDefault: true, PreRelease: featuregate.GA},
 	},
 	CustomResourceFieldSelectors: {
 		{Version: version.MustParse("1.30"), Default: false, PreRelease: featuregate.Alpha},

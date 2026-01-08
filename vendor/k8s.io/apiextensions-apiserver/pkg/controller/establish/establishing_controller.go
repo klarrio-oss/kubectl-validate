@@ -45,7 +45,7 @@ type EstablishingController struct {
 	crdSynced cache.InformerSynced
 
 	// To allow injection for testing.
-	syncFn func(ctx context.Context, key string) error
+	syncFn func(key string) error
 
 	queue workqueue.TypedRateLimitingInterface[string]
 }
@@ -73,45 +73,39 @@ func (ec *EstablishingController) QueueCRD(key string, timeout time.Duration) {
 	ec.queue.AddAfter(key, timeout)
 }
 
-// RunWithContext starts the EstablishingController.
-func (ec *EstablishingController) RunWithContext(ctx context.Context) {
+// Run starts the EstablishingController.
+func (ec *EstablishingController) Run(stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer ec.queue.ShutDown()
 
-	logger := klog.FromContext(ctx)
-	logger.V(2).Info("Starting EstablishingController")
-	defer logger.V(2).Info("Shutting down EstablishingController")
+	klog.Info("Starting EstablishingController")
+	defer klog.Info("Shutting down EstablishingController")
 
-	if !cache.WaitForCacheSync(ctx.Done(), ec.crdSynced) {
+	if !cache.WaitForCacheSync(stopCh, ec.crdSynced) {
 		return
 	}
 
-	// only start one worker thread since the EstablishingController is not a bottleneck
-	go wait.UntilWithContext(ctx, ec.runWorker, time.Second)
+	// only start one worker thread since its a slow moving API
+	go wait.Until(ec.runWorker, time.Second, stopCh)
 
-	<-ctx.Done()
+	<-stopCh
 }
 
-//logcheck:context // RunWithContext should be used instead of Run in code which supports contextual logging.
-func (ec *EstablishingController) Run(stopCh <-chan struct{}) {
-	ec.RunWithContext(wait.ContextForChannel(stopCh))
-}
-
-func (ec *EstablishingController) runWorker(ctx context.Context) {
-	for ec.processNextWorkItem(ctx) {
+func (ec *EstablishingController) runWorker() {
+	for ec.processNextWorkItem() {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.
 // It returns false when it's time to quit.
-func (ec *EstablishingController) processNextWorkItem(ctx context.Context) bool {
+func (ec *EstablishingController) processNextWorkItem() bool {
 	key, quit := ec.queue.Get()
 	if quit {
 		return false
 	}
 	defer ec.queue.Done(key)
 
-	err := ec.syncFn(ctx, key)
+	err := ec.syncFn(key)
 	if err == nil {
 		ec.queue.Forget(key)
 		return true
@@ -124,7 +118,7 @@ func (ec *EstablishingController) processNextWorkItem(ctx context.Context) bool 
 }
 
 // sync is used to turn CRDs into the Established state.
-func (ec *EstablishingController) sync(ctx context.Context, key string) error {
+func (ec *EstablishingController) sync(key string) error {
 	cachedCRD, err := ec.crdLister.Get(key)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -164,7 +158,7 @@ func (ec *EstablishingController) sync(ctx context.Context, key string) error {
 	}
 
 	// Update server with new CRD condition.
-	_, err = ec.crdClient.CustomResourceDefinitions().UpdateStatus(ctx, crd, metav1.UpdateOptions{})
+	_, err = ec.crdClient.CustomResourceDefinitions().UpdateStatus(context.TODO(), crd, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		// deleted or changed in the meantime, we'll get called again
 		return nil
